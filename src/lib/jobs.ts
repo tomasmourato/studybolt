@@ -274,10 +274,9 @@ async function makePodcast(id: string) {
       patiently(
         () =>
           synthesizeDialogue(
-            `TTS the following conversation between ${alex.name} and ${sam.name} in a warm, upbeat podcast style:\n\n${chunk
-              .map((l) => `${l.speaker}: ${l.text}`)
-              .join("\n")}`,
+            chunk,
             [alex, sam],
+            `TTS the following conversation between ${alex.name} and ${sam.name} in a warm, upbeat podcast style:`,
           ),
         showWait,
       ),

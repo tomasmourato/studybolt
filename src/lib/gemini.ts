@@ -13,6 +13,7 @@ import { getApiKey } from "./api-key";
 import { base64ToBytes, concatBytes } from "./bytes";
 import { hasMangledLatex, restoreEscapes } from "./json-latex";
 import type { GeminiFileRef } from "./types";
+import { TTS_SAMPLE_RATE, wavToPcm } from "./wav";
 
 export class MissingApiKeyError extends Error {
   constructor() {
@@ -68,22 +69,35 @@ function client(): GoogleGenAI {
 
 const unique = (models: (string | undefined)[]) => [...new Set(models.filter((m): m is string => !!m))];
 
-// Free-tier quotas are per model (some allow only ~20 requests a day), so each tier falls back
+// Gemma 4 runs on the same key with its own capacity, which often holds up when Gemini is overloaded,
+// so it's the last resort for text. It can't read files or media, and its free tier takes only
+// about 16k input tokens a minute, so larger requests skip it.
+const GEMMA = ["gemma-4-26b-a4b-it", "gemma-4-31b-it"];
+const GEMMA_MAX_INPUT_CHARS = 40_000;
+const isGemma = (model: string) => model.startsWith("gemma-");
+
+// Free-tier quotas and capacity are per model (some allow only ~20 requests a day), so each tier falls back
 // through several models. "smart" writes what students read; "fast" handles titles, transcripts and drawings.
 const MODELS = {
   smart: unique([
     process.env.NEXT_PUBLIC_GEMINI_MODEL,
     "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
+    ...GEMMA,
   ]),
   fast: unique([
     process.env.NEXT_PUBLIC_GEMINI_FAST_MODEL,
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
     "gemini-3.8-flash",
+    ...GEMMA,
   ]),
   image: unique([
     process.env.NEXT_PUBLIC_GEMINI_IMAGE_MODEL,
@@ -91,10 +105,43 @@ const MODELS = {
     "gemini-3.1-flash-lite-image",
     "gemini-2.5-flash-image",
   ]),
-  tts: unique([process.env.NEXT_PUBLIC_GEMINI_TTS_MODEL, "gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"]),
+  tts: unique([
+    process.env.NEXT_PUBLIC_GEMINI_TTS_MODEL,
+    "gemini-3.1-flash-tts-preview",
+    "gemini-3.8-flash-tts",
+    "gemini-3.8-flash-lite-tts",
+    "gemini-2.5-flash-preview-tts",
+  ]),
 };
 type ModelKind = keyof typeof MODELS;
 export type ModelTier = "smart" | "fast";
+
+/** Characters of text in a request, or null when it includes files or media that only Gemini can read. */
+function textChars(value: unknown): number | null {
+  if (typeof value === "string") return value.length;
+  if (Array.isArray(value)) {
+    let total = 0;
+    for (const item of value) {
+      const chars = textChars(item);
+      if (chars === null) return null;
+      total += chars;
+    }
+    return total;
+  }
+  if (value && typeof value === "object") {
+    const part = value as { text?: unknown; parts?: unknown; fileData?: unknown; inlineData?: unknown };
+    if (part.fileData || part.inlineData) return null;
+    if (typeof part.text === "string") return part.text.length;
+    if (part.parts) return textChars(part.parts);
+  }
+  return 0;
+}
+
+/** Whether Gemma can take this request: text only, and small enough for its free tier. */
+function fitsGemma(contents: ContentListUnion, config?: GenerateContentConfig) {
+  const chars = textChars([contents, config?.systemInstruction ?? ""]);
+  return chars !== null && chars <= GEMMA_MAX_INPUT_CHARS;
+}
 
 // Models occasionally accept a request and never answer, so every call has deadlines.
 const FIRST_CHUNK_TIMEOUT_MS = 90_000;
@@ -218,19 +265,30 @@ export async function patiently<T>(run: () => Promise<T>, onPause: (secondsLeft:
   }
 }
 
-/** Runs a request against the best available model of a kind, falling back on quota, overload, timeout or not-found errors. */
-async function withModel<T>(kind: ModelKind, run: (model: string) => Promise<T>): Promise<T> {
-  const usable = MODELS[kind].filter((m) => cooldowns.get(m) !== Infinity);
+/**
+ * Runs a request against the best available model of a kind, falling back on quota, overload, timeout or not-found errors.
+ * Gemma is only tried when `gemmaCanHelp` says the request suits it.
+ */
+async function withModel<T>(kind: ModelKind, run: (model: string) => Promise<T>, gemmaCanHelp = false): Promise<T> {
+  const usable = MODELS[kind].filter((m) => cooldowns.get(m) !== Infinity && (gemmaCanHelp || !isGemma(m)));
   const ready = usable.filter((m) => (cooldowns.get(m) ?? 0) <= Date.now());
   // If everything is cooling down, try anyway: a stale cooldown shouldn't block the student.
   const candidates = ready.length ? ready : usable;
 
   let lastError: unknown = new Error("None of the configured Gemini models are available for this API key.");
+  let geminiError: unknown;
   for (const model of candidates) {
     try {
       return await retrying(() => run(model));
     } catch (err) {
       const cooldown = cooldownFor(err);
+      // Gemma is a last resort, so its failures never replace the reason the Gemini models gave.
+      if (isGemma(model)) {
+        if (cooldown !== null) markCooldown(model, cooldown);
+        console.warn(`Fallback ${model} failed too.`, err);
+        lastError = err;
+        continue;
+      }
       if (cooldown === null) throw err;
       markCooldown(model, cooldown);
       const reason =
@@ -240,10 +298,10 @@ async function withModel<T>(kind: ModelKind, run: (model: string) => Promise<T>)
             ? "stream cut off"
             : `status ${errorInfo(err)?.status}`;
       console.warn(`Gemini ${model} failed (${reason}); trying the next model.`);
-      lastError = err;
+      geminiError = err;
     }
   }
-  throw lastError;
+  throw geminiError ?? lastError;
 }
 
 /**
@@ -329,10 +387,22 @@ function withThinking(model: string, { config, effort = "default" }: GenerateOpt
   return { ...config };
 }
 
+/**
+ * The request's config for a given model. Gemma stops lists after one item when held to a JSON schema,
+ * so it gets the schema as an instruction instead.
+ */
+function configFor(model: string, options: GenerateOptions): GenerateContentConfig {
+  const config = withThinking(model, options);
+  const { responseJsonSchema, systemInstruction, ...rest } = config;
+  if (!isGemma(model) || !responseJsonSchema || (systemInstruction && typeof systemInstruction !== "string")) return config;
+  const instruction = `Reply with only JSON that matches this JSON Schema:\n${JSON.stringify(responseJsonSchema)}`;
+  return { ...rest, systemInstruction: systemInstruction ? `${systemInstruction}\n\n${instruction}` : instruction };
+}
+
 /** Generates a complete text response. It streams internally so a stalled model is detected and replaced. */
 export function generateText(contents: ContentListUnion, options: GenerateOptions = {}): Promise<string> {
   return withModel(options.tier ?? "smart", async (model) => {
-    const stream = await openStream(model, contents, withThinking(model, options));
+    const stream = await openStream(model, contents, configFor(model, options));
     let text = "";
     try {
       for (let result = await stream.next(); !result.done; result = await stream.next()) {
@@ -342,7 +412,20 @@ export function generateText(contents: ContentListUnion, options: GenerateOption
       stream.close();
     }
     return text;
-  });
+  }, fitsGemma(contents, options.config));
+}
+
+/** Parses a model's JSON answer, which (Gemma especially) sometimes comes wrapped in a Markdown fence. */
+function parseModelJson(text: string): unknown {
+  const trimmed = text.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch (err) {
+    const start = trimmed.search(/[[{]/);
+    const end = Math.max(trimmed.lastIndexOf("}"), trimmed.lastIndexOf("]"));
+    if (start < 0 || end <= start) throw err;
+    return JSON.parse(trimmed.slice(start, end + 1));
+  }
 }
 
 /** Parses a structured answer, generating it again once if its LaTeX was mangled by JSON escaping. */
@@ -358,7 +441,7 @@ export async function generateJson<T>(
     });
     let value: T;
     try {
-      value = JSON.parse(text) as T;
+      value = parseModelJson(text) as T;
     } catch {
       throw new Error("Gemini returned an unexpected response. Please try again.");
     }
@@ -378,7 +461,7 @@ export async function generateJson<T>(
 export async function* streamText(contents: ContentListUnion, options: GenerateOptions = {}): AsyncGenerator<string> {
   let activeModel = "";
   const { stream, first } = await withModel(options.tier ?? "smart", async (model) => {
-    const stream = await openStream(model, contents, withThinking(model, options));
+    const stream = await openStream(model, contents, configFor(model, options));
     try {
       let first = await stream.next();
       while (!first.done && !first.value.text) first = await stream.next();
@@ -388,7 +471,7 @@ export async function* streamText(contents: ContentListUnion, options: GenerateO
       stream.close();
       throw err;
     }
-  });
+  }, fitsGemma(contents, options.config));
   try {
     for (let result = first; !result.done; result = await stream.next()) {
       if (result.value.text) yield result.value.text;
@@ -500,21 +583,46 @@ export async function uploadFile(
   };
 }
 
-/** Renders speech to raw 16-bit PCM. */
-function synthesize(prompt: string, speechConfig: SpeechConfig): Promise<{ pcm: Uint8Array<ArrayBuffer>; sampleRate: number }> {
+// Newer TTS models want each line of a conversation as its own text part tagged with its speaker;
+// older ones read a "Name: line" script from a single part.
+const tagsSpeakers = (model: string) => /^gemini-3\.8-flash(-lite)?-tts/.test(model);
+
+type SpeechPart = { text: string; speechMetadata?: { speaker: string } };
+
+/** Turns one audio part (raw PCM or WAV, depending on the model) into PCM samples. */
+function decodeSpeech(data: string, mimeType = "") {
+  const bytes = base64ToBytes(data);
+  if (mimeType.includes("wav")) return wavToPcm(bytes);
+  return { pcm: bytes, sampleRate: Number(/rate=(\d+)/.exec(mimeType)?.[1]) || TTS_SAMPLE_RATE };
+}
+
+/**
+ * Renders speech to raw 16-bit PCM. It calls the REST API directly because the SDK drops the speaker tags
+ * that newer TTS models need.
+ */
+function synthesize(
+  partsFor: (model: string) => SpeechPart[],
+  speechConfig: SpeechConfig,
+): Promise<{ pcm: Uint8Array<ArrayBuffer>; sampleRate: number }> {
+  client(); // Resets model cooldowns when the student changed their key.
   return withModel("tts", async (model) => {
-    const response = await withDeadline(model, MEDIA_TIMEOUT_MS, (abortSignal) =>
-      client().models.generateContent({
-        model,
-        contents: prompt,
-        config: { responseModalities: ["AUDIO"], speechConfig, abortSignal },
-      }),
-    );
+    const response = await withDeadline(model, MEDIA_TIMEOUT_MS, async (signal) => {
+      const res = await fetch(`${API_ORIGIN}/v1beta/models/${model}:generateContent`, {
+        method: "POST",
+        headers: { "x-goog-api-key": requireKey(), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: partsFor(model) }],
+          generationConfig: { responseModalities: ["AUDIO"], speechConfig },
+        }),
+        signal,
+      });
+      if (!res.ok) throw await errorFromResponse(res);
+      return (await res.json()) as GenerateContentResponse;
+    });
     const parts = response.candidates?.[0]?.content?.parts ?? [];
-    const audio = parts.flatMap((p) => (p.inlineData?.data ? [p.inlineData] : []));
-    if (!audio.length) throw new Error("Gemini did not return any audio.");
-    const rate = Number(/rate=(\d+)/.exec(audio[0].mimeType ?? "")?.[1]) || 24000;
-    return { pcm: concatBytes(audio.map((a) => base64ToBytes(a.data!))), sampleRate: rate };
+    const clips = parts.flatMap((p) => (p.inlineData?.data ? [decodeSpeech(p.inlineData.data, p.inlineData.mimeType)] : []));
+    if (!clips.length) throw new Error("Gemini did not return any audio.");
+    return { pcm: concatBytes(clips.map((c) => c.pcm)), sampleRate: clips[0].sampleRate };
   });
 }
 
@@ -523,21 +631,29 @@ export interface Speaker {
   voice: string;
 }
 
-/** Renders a two-speaker script ("Name: line" per line). */
-export function synthesizeDialogue(script: string, speakers: [Speaker, Speaker]) {
-  return synthesize(script, {
-    multiSpeakerVoiceConfig: {
-      speakerVoiceConfigs: speakers.map((s) => ({
-        speaker: s.name,
-        voiceConfig: { prebuiltVoiceConfig: { voiceName: s.voice } },
-      })),
+/** Renders a two-host conversation. `direction` sets the tone for models that read the script as one text. */
+export function synthesizeDialogue(lines: { speaker: string; text: string }[], speakers: [Speaker, Speaker], direction: string) {
+  const host = (speaker: string) =>
+    speakers.find((s) => s.name.toLowerCase() === speaker.trim().toLowerCase())?.name ?? speakers[0].name;
+  return synthesize(
+    (model) =>
+      tagsSpeakers(model)
+        ? lines.map((l) => ({ text: l.text, speechMetadata: { speaker: host(l.speaker) } }))
+        : [{ text: `${direction}\n\n${lines.map((l) => `${host(l.speaker)}: ${l.text}`).join("\n")}` }],
+    {
+      multiSpeakerVoiceConfig: {
+        speakerVoiceConfigs: speakers.map((s) => ({
+          speaker: s.name,
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: s.voice } },
+        })),
+      },
     },
-  });
+  );
 }
 
 /** Renders a single narrator's voice. */
 export function synthesizeSpeech(prompt: string, voice: string) {
-  return synthesize(prompt, { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } });
+  return synthesize(() => [{ text: prompt }], { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } });
 }
 
 /** Turns SDK and network errors into a message that is safe and useful to show in the UI. */

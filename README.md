@@ -66,16 +66,18 @@ Optional environment variables:
 
 ## Gemini models and free-tier limits
 
-Each Gemini model has its own quota, and some free-tier models allow only about 20 requests per day. The app picks models by task and falls back automatically when one is out of quota, overloaded or unavailable to the student's key:
+Each Gemini model has its own quota and capacity, and some free-tier models allow only about 20 requests per day. The app picks models by task and falls back automatically when one is out of quota, overloaded or unavailable to the student's key:
 
 | Task | Default order |
 | --- | --- |
-| Notes, flashcards, quizzes, chat, podcast scripts | `gemini-3.8-flash` → `gemini-3.5-flash` → `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` |
-| Titles and transcripts | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` → `gemini-3.5-flash` → `gemini-3.8-flash` |
-| Podcast voices and lesson narration | `gemini-3.1-flash-tts-preview` → `gemini-2.5-flash-preview-tts` |
+| Notes, flashcards, quizzes, chat, podcast scripts | `gemini-3.8-flash` → `gemini-3.7-flash` → `gemini-3.6-flash` → `gemini-3.5-flash` → `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` → Gemma 4 |
+| Titles and transcripts | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` → `gemini-3.5-flash` → `gemini-3.6-flash` → `gemini-3.7-flash` → `gemini-3.8-flash` → Gemma 4 |
+| Podcast voices and lesson narration | `gemini-3.1-flash-tts-preview` → `gemini-3.8-flash-tts` → `gemini-3.8-flash-lite-tts` → `gemini-2.5-flash-preview-tts` |
 | Lesson illustrations | `gemini-3.1-flash-image` → `gemini-3.1-flash-lite-image` → `gemini-2.5-flash-image` |
 
 A model that hits a daily quota is skipped for an hour; daily quotas reset at midnight Pacific time. Image models have no free-tier quota, so without billing, lesson illustrations are drawn as simple SVG graphics by a text model instead.
+
+**When Gemini is overloaded.** Google serves free-tier requests from capacity it can cut when demand spikes, so every Gemini model can answer "503 high demand" for minutes at a time. The last resort is Gemma 4 (`gemma-4-26b-a4b-it`, then `gemma-4-31b-it`), open models that run on the same key with their own capacity. Gemma only reads text and its free tier accepts about 16,000 input tokens a minute, so it covers chat, flashcards, quizzes, lessons and notes from shorter text materials; larger materials, files, audio, video and YouTube still need Gemini. Notes, lessons and podcasts also wait and try again for up to two minutes, showing a countdown.
 
 ## How it works
 
