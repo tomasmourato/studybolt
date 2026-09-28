@@ -69,6 +69,7 @@ export function PodcastTab({ set, patch }: TabProps) {
             );
           })}
         </ol>
+        {podcast.notice && <p className="text-sm text-muted">{podcast.notice}</p>}
       </EmptyPanel>
     );
   }

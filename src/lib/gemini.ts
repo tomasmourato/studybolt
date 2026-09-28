@@ -184,6 +184,40 @@ async function retrying<T>(run: () => Promise<T>, attempts = 2): Promise<T> {
   }
 }
 
+/** True when Google is overloaded or briefly rate-limiting, so the same request is likely to work a little later. */
+function isTemporary(err: unknown) {
+  if (err instanceof GeminiStreamError) return true;
+  const info = errorInfo(err);
+  if (!info) return false;
+  if (info.status === 429) return !notInPlan(info) && !dailyQuota(info);
+  return OVERLOAD_STATUSES.has(info.status);
+}
+
+// Pauses before running background work again while Gemini is overloaded: two minutes in all.
+const BUSY_PAUSES_SEC = [20, 40, 60];
+
+/**
+ * Runs background work (notes, lessons, podcasts) again after a pause when Gemini was overloaded on every model,
+ * since Google's demand spikes usually pass within minutes. `onPause` gets the seconds left once a second,
+ * then null when the work starts again.
+ */
+export async function patiently<T>(run: () => Promise<T>, onPause: (secondsLeft: number | null) => unknown): Promise<T> {
+  for (let round = 0; ; round++) {
+    try {
+      return await run();
+    } catch (err) {
+      const pause = BUSY_PAUSES_SEC[round];
+      if (pause === undefined || !isTemporary(err)) throw err;
+      console.warn(`Gemini is overloaded; trying again in ${pause}s.`, err);
+      for (let left = pause; left > 0; left--) {
+        await onPause(left);
+        await sleep(1000);
+      }
+      await onPause(null);
+    }
+  }
+}
+
 /** Runs a request against the best available model of a kind, falling back on quota, overload, timeout or not-found errors. */
 async function withModel<T>(kind: ModelKind, run: (model: string) => Promise<T>): Promise<T> {
   const usable = MODELS[kind].filter((m) => cooldowns.get(m) !== Infinity);
@@ -390,19 +424,22 @@ const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 /** Sends a file with the Files API's resumable protocol, in chunks, so progress can be shown. */
 async function sendResumable(blob: Blob, mimeType: string, displayName: string, onProgress?: (fraction: number) => void) {
   const key = requireKey();
-  const start = await fetch(`${API_ORIGIN}/upload/v1beta/files`, {
-    method: "POST",
-    headers: {
-      "x-goog-api-key": key,
-      "Content-Type": "application/json",
-      "X-Goog-Upload-Protocol": "resumable",
-      "X-Goog-Upload-Command": "start",
-      "X-Goog-Upload-Header-Content-Length": String(blob.size),
-      "X-Goog-Upload-Header-Content-Type": mimeType,
-    },
-    body: JSON.stringify({ file: { displayName } }),
-  });
-  if (!start.ok) throw await errorFromResponse(start);
+  const start = await retrying(async () => {
+    const res = await fetch(`${API_ORIGIN}/upload/v1beta/files`, {
+      method: "POST",
+      headers: {
+        "x-goog-api-key": key,
+        "Content-Type": "application/json",
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": String(blob.size),
+        "X-Goog-Upload-Header-Content-Type": mimeType,
+      },
+      body: JSON.stringify({ file: { displayName } }),
+    });
+    if (!res.ok) throw await errorFromResponse(res);
+    return res;
+  }, 4);
   const uploadUrl = start.headers.get("x-goog-upload-url");
   if (!uploadUrl) throw new Error("Gemini didn't accept the upload. Please try again.");
 
@@ -525,7 +562,12 @@ export function describeError(err: unknown): string {
   }
   if (info.status === 403) return "This API key doesn't have access to that Gemini feature.";
   if (info.status === 404) return "None of the configured Gemini models are available for this API key.";
-  if (info.status >= 500) return `Gemini is overloaded or temporarily unavailable (${info.status}). Try again in a moment.`;
+  if (info.status === 503) {
+    return "Google's Gemini servers are overloaded right now (503). This is on Google's side, not your key, and usually passes within a few minutes. Try again soon.";
+  }
+  if (info.status >= 500) {
+    return `Google's Gemini servers had a problem (${info.status}). This is on Google's side, not your key. Try again in a moment.`;
+  }
   return `Gemini error: ${info.message.slice(0, 300)}`;
 }
 

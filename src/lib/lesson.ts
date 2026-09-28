@@ -1,5 +1,5 @@
 import { nanoid } from "nanoid";
-import { describeError, generateImage, generateJson, generateText, synthesizeSpeech } from "./gemini";
+import { describeError, generateImage, generateJson, generateText, patiently, synthesizeSpeech } from "./gemini";
 import { runOnce, tracked } from "./jobs";
 import {
   LESSON_SCHEMA,
@@ -32,7 +32,13 @@ async function buildLesson(setId: string, { level, length, focus }: LessonOption
     if (!set) return;
     await deleteFiles(`${lessonDir(setId)}/`);
 
-    const draft = await generateJson<LessonDraft>(lessonPrompt(set, level, length, focus), LESSON_SCHEMA);
+    const draft = await patiently(
+      () => generateJson<LessonDraft>(lessonPrompt(set, level, length, focus), LESSON_SCHEMA),
+      (left) =>
+        updateSet(setId, (s) => {
+          if (s.lesson) s.lesson.notice = left ? `Gemini is overloaded on Google's side. Trying again in ${left}s…` : undefined;
+        }),
+    );
     const sections = draft.sections
       .filter((s) => s.heading?.trim() && s.body?.trim())
       .map((s): LessonSection => {
@@ -61,6 +67,7 @@ async function buildLesson(setId: string, { level, length, focus }: LessonOption
         ...s.lesson,
         status: "ready",
         error: undefined,
+        notice: undefined,
         title: draft.title?.trim() || s.title,
         objective: draft.objective?.trim(),
         sections,
@@ -70,7 +77,7 @@ async function buildLesson(setId: string, { level, length, focus }: LessonOption
   } catch (err) {
     console.error(`Lesson generation failed for set ${setId}:`, err);
     await updateSet(setId, (s) => {
-      if (s.lesson) s.lesson = { ...s.lesson, status: "error", error: describeError(err) };
+      if (s.lesson) s.lesson = { ...s.lesson, status: "error", error: describeError(err), notice: undefined };
     });
   }
 }

@@ -1,7 +1,15 @@
 import type { Part } from "@google/genai";
 import { mapLimit } from "./async";
 import { concatBytes } from "./bytes";
-import { describeError, generateJson, generateText, streamText, synthesizeDialogue, uploadFile } from "./gemini";
+import {
+  describeError,
+  generateJson,
+  generateText,
+  patiently,
+  streamText,
+  synthesizeDialogue,
+  uploadFile,
+} from "./gemini";
 import { withTabLock } from "./locks";
 import {
   META_SCHEMA,
@@ -172,17 +180,28 @@ async function processSet(id: string) {
     const transcripts = mapLimit(sources, 2, (source, i) =>
       TEXT_KINDS.has(source.kind)
         ? Promise.resolve(source.text)
-        : generateText([{ role: "user", parts: [...perSource[i], { text: transcriptPrompt(source.kind) }] }], {
-            config: { maxOutputTokens: 65536 },
-            tier: "fast",
-            effort: "low",
-          }).catch((err) => {
+        : patiently(
+            () =>
+              generateText([{ role: "user", parts: [...perSource[i], { text: transcriptPrompt(source.kind) }] }], {
+                config: { maxOutputTokens: 65536 },
+                tier: "fast",
+                effort: "low",
+              }),
+            () => {},
+          ).catch((err) => {
             console.error(`Transcript failed for source ${i + 1} of set ${id}:`, err);
             return undefined;
           }),
     );
 
-    const notes = await writeNotes(id, parts, notesPrompt(sources.map((s) => s.kind)));
+    const notes = await patiently(
+      () => writeNotes(id, parts, notesPrompt(sources.map((s) => s.kind))),
+      (left) =>
+        updateSet(id, (s) => {
+          s.notes = "";
+          s.stage = left ? `Gemini is overloaded on Google's side · trying again in ${left}s` : "Writing notes";
+        }),
+    );
     if (!notes) throw new Error("Gemini returned empty notes. Please try again.");
     await updateSet(id, (s) => {
       s.notes = notes;
@@ -236,8 +255,15 @@ async function makePodcast(id: string) {
     const set = await getSet(id);
     if (!set) return;
     await updateSet(id, (s) => void (s.podcast = { status: "scripting" }));
+    const showWait = (left: number | null) =>
+      updateSet(id, (s) => {
+        if (s.podcast) s.podcast.notice = left ? `Gemini is overloaded on Google's side. Trying again in ${left}s…` : undefined;
+      });
 
-    const script = await generateJson<{ title: string; lines: PodcastLine[] }>(podcastPrompt(set), PODCAST_SCHEMA);
+    const script = await patiently(
+      () => generateJson<{ title: string; lines: PodcastLine[] }>(podcastPrompt(set), PODCAST_SCHEMA),
+      showWait,
+    );
     const lines = script.lines.filter((l) => l.text?.trim());
     if (!lines.length) throw new Error("Gemini returned an empty podcast script.");
     await updateSet(id, (s) => void (s.podcast = { status: "voicing", title: script.title, lines }));
@@ -245,11 +271,15 @@ async function makePodcast(id: string) {
     // Speech quality drifts on long inputs, so the script is voiced in chunks and stitched together.
     const [alex, sam] = PODCAST_HOSTS;
     const clips = await mapLimit(chunkLines(lines, 1800), 3, (chunk) =>
-      synthesizeDialogue(
-        `TTS the following conversation between ${alex.name} and ${sam.name} in a warm, upbeat podcast style:\n\n${chunk
-          .map((l) => `${l.speaker}: ${l.text}`)
-          .join("\n")}`,
-        [alex, sam],
+      patiently(
+        () =>
+          synthesizeDialogue(
+            `TTS the following conversation between ${alex.name} and ${sam.name} in a warm, upbeat podcast style:\n\n${chunk
+              .map((l) => `${l.speaker}: ${l.text}`)
+              .join("\n")}`,
+            [alex, sam],
+          ),
+        showWait,
       ),
     );
     const sampleRate = clips[0].sampleRate;
@@ -268,6 +298,6 @@ async function makePodcast(id: string) {
     });
   } catch (err) {
     console.error(`Podcast failed for set ${id}:`, err);
-    await updateSet(id, (s) => void (s.podcast = { ...s.podcast, status: "error", error: describeError(err) }));
+    await updateSet(id, (s) => void (s.podcast = { ...s.podcast, status: "error", error: describeError(err), notice: undefined }));
   }
 }

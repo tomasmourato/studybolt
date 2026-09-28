@@ -78,6 +78,7 @@ export function LessonTab({ set, patch }: TabProps) {
         body="Writing explanations, checkpoint questions and illustration ideas. This usually takes under a minute."
       >
         <LoaderCircle className="size-6 animate-spin text-accent" />
+        {lesson.notice && <p className="text-sm text-muted">{lesson.notice}</p>}
       </EmptyPanel>
     );
   }

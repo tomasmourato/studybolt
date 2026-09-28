@@ -71,6 +71,8 @@ export interface PodcastLine {
 
 export interface Podcast {
   status: PodcastStatus;
+  /** Shown while the work waits for Gemini to recover from an overload. */
+  notice?: string;
   title?: string;
   lines?: PodcastLine[];
   audioFile?: string;
@@ -112,6 +114,8 @@ export type LessonLength = "short" | "standard" | "deep";
 
 export interface Lesson {
   status: "generating" | "ready" | "error";
+  /** Shown while the work waits for Gemini to recover from an overload. */
+  notice?: string;
   error?: string;
   level: LessonLevel;
   length: LessonLength;
