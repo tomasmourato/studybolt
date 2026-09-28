@@ -29,6 +29,22 @@ export class GeminiTimeoutError extends Error {
   }
 }
 
+/** The response stream broke off partway through an answer. */
+export class GeminiStreamError extends Error {
+  model: string;
+  constructor(model: string, cause: unknown) {
+    super(`Gemini ${model}'s answer was cut off.`, { cause });
+    this.model = model;
+  }
+}
+
+/**
+ * When Google ends a stream early (usually an error sent mid-answer), the SDK reports the leftover text as
+ * "Incomplete JSON segment at the end"; a dropped connection shows up as a TypeError while reading.
+ */
+const isStreamCut = (err: unknown) =>
+  err instanceof TypeError || (err instanceof Error && /incomplete json segment|parsing stream chunk/i.test(err.message));
+
 // Every request goes straight from the browser to Google with the student's own key.
 const API_ORIGIN = "https://generativelanguage.googleapis.com";
 
@@ -103,7 +119,8 @@ function errorInfo(err: unknown): ErrorInfo | null {
   const info: ErrorInfo = { status: err.status, message: err.message, quotas: [] };
   try {
     type Body = { error?: { message?: string; details?: Record<string, unknown>[] } };
-    let body = JSON.parse(err.message) as Body;
+    // Errors sent inside a stream arrive as "got status: 503. {...}".
+    let body = JSON.parse(err.message.replace(/^got status: [^{]*/, "")) as Body;
     // When a streamed request fails, the SDK wraps Google's JSON error in a second error as text.
     const inner = body.error?.message?.trim();
     if (inner?.startsWith("{")) {
@@ -134,6 +151,7 @@ const dailyQuota = (info: ErrorInfo) => info.quotas.some((q) => q.id.includes("P
 /** How long to avoid a model after this error, or null when the error isn't the model's fault. */
 function cooldownFor(err: unknown): number | null {
   if (err instanceof GeminiTimeoutError) return 5 * 60_000;
+  if (err instanceof GeminiStreamError) return 30_000;
   const info = errorInfo(err);
   if (!info) return null;
   if (info.status === 404 || (info.status === 400 && /model.*not (found|supported)/i.test(info.message))) {
@@ -159,7 +177,7 @@ async function retrying<T>(run: () => Promise<T>, attempts = 2): Promise<T> {
     try {
       return await run();
     } catch (err) {
-      const overloaded = err instanceof ApiError && OVERLOAD_STATUSES.has(err.status);
+      const overloaded = (err instanceof ApiError && OVERLOAD_STATUSES.has(err.status)) || err instanceof GeminiStreamError;
       if (!overloaded || attempt >= attempts) throw err;
       await sleep(1500 * attempt);
     }
@@ -181,7 +199,12 @@ async function withModel<T>(kind: ModelKind, run: (model: string) => Promise<T>)
       const cooldown = cooldownFor(err);
       if (cooldown === null) throw err;
       markCooldown(model, cooldown);
-      const reason = err instanceof GeminiTimeoutError ? "timed out" : `status ${errorInfo(err)?.status}`;
+      const reason =
+        err instanceof GeminiTimeoutError
+          ? "timed out"
+          : err instanceof GeminiStreamError
+            ? "stream cut off"
+            : `status ${errorInfo(err)?.status}`;
       console.warn(`Gemini ${model} failed (${reason}); trying the next model.`);
       lastError = err;
     }
@@ -228,7 +251,12 @@ async function openStream(model: string, contents: ContentListUnion, config: Gen
   }
   return {
     async next() {
-      const result = await limit.race(stream.next());
+      let result: IteratorResult<GenerateContentResponse>;
+      try {
+        result = await limit.race(stream.next());
+      } catch (err) {
+        throw isStreamCut(err) ? new GeminiStreamError(model, err) : err;
+      }
       if (result.done) limit.clear();
       else limit.arm(IDLE_TIMEOUT_MS);
       return result;
@@ -310,7 +338,7 @@ export async function generateJson<T>(
 }
 
 /**
- * Streams text deltas. Errors before the first chunk fall back to another model;
+ * Streams text deltas. Errors before the first text are retried or fall back to another model;
  * errors after that are thrown to the caller, since part of the answer was already shown.
  */
 export async function* streamText(contents: ContentListUnion, options: GenerateOptions = {}): AsyncGenerator<string> {
@@ -318,7 +346,8 @@ export async function* streamText(contents: ContentListUnion, options: GenerateO
   const { stream, first } = await withModel(options.tier ?? "smart", async (model) => {
     const stream = await openStream(model, contents, withThinking(model, options));
     try {
-      const first = await stream.next();
+      let first = await stream.next();
+      while (!first.done && !first.value.text) first = await stream.next();
       activeModel = model;
       return { stream, first };
     } catch (err) {
@@ -477,6 +506,7 @@ export function synthesizeSpeech(prompt: string, voice: string) {
 /** Turns SDK and network errors into a message that is safe and useful to show in the UI. */
 export function describeError(err: unknown): string {
   if (err instanceof GeminiTimeoutError) return "Gemini took too long to respond. Try again in a moment.";
+  if (err instanceof GeminiStreamError) return "Gemini's answer was cut off partway through. Try again in a moment.";
   if (err instanceof TypeError && /fetch|network/i.test(err.message)) {
     return "Couldn't reach Google's Gemini API. Check your internet connection and try again.";
   }

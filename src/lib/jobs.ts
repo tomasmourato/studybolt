@@ -100,7 +100,10 @@ function unwrapMarkdown(text: string) {
   return (match ? match[1] : text).trim();
 }
 
-/** Streams notes into the set as they arrive, starting over once if the stream dies partway through. */
+/**
+ * Streams notes into the set as they arrive. Long answers from large materials sometimes break off partway,
+ * so the notes start over, up to three tries in all. The model that failed rests briefly, so the next try uses another.
+ */
 async function writeNotes(id: string, parts: Part[], prompt: string) {
   for (let attempt = 1; ; attempt++) {
     let notes = "";
@@ -120,7 +123,7 @@ async function writeNotes(id: string, parts: Part[], prompt: string) {
       }
       return unwrapMarkdown(notes);
     } catch (err) {
-      if (attempt >= 2 || !notes) throw err;
+      if (attempt >= 3 || !notes) throw err;
       console.warn(`Notes stream for set ${id} failed partway; starting over.`, err);
       await updateSet(id, (s) => void (s.notes = ""));
     }
