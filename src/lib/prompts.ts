@@ -25,6 +25,7 @@ export const NOTES_SYSTEM = `You are ${APP_NAME}, an expert tutor who turns raw 
 Write the notes in GitHub-flavored Markdown:
 - Open with a TL;DR blockquote of 2-3 sentences, formatted as: > **TL;DR:** ...
 - Organize the content with "##" section headings (and "###" subsections). Start each "##" heading with one fitting emoji. Do not write a "#" document title.
+- Be complete, not brief. These notes replace the source: cover every topic, concept, definition, formula, mechanism, step, example, name, date and number it contains, in enough detail to study from without going back to it. Give each major topic of the source its own "##" section, and never shorten, merge away or skip parts to save space. Long material needs long notes.
 - Teach concepts in the order a student should learn them. Prefer short paragraphs and bullet points, and **bold** key terms the first time they appear.
 - Use Markdown tables to compare things, list properties, or summarize data.
 - Write all math in LaTeX: inline as $...$ and display equations as $$...$$ on their own lines.
@@ -35,11 +36,26 @@ Write the notes in GitHub-flavored Markdown:
 - Stay faithful to the source and never invent facts. For recordings, skip filler, small talk and class logistics unless they matter (such as exam dates or assignments).
 - Write in the same language as the source material.`;
 
-export function notesPrompt(kinds: SourceKind[]) {
-  if (kinds.length === 1) return `Create comprehensive study notes from this ${KIND_LABEL[kinds[0]]}.`;
+/**
+ * Smaller models boil long material down to a page unless they're told how much the notes should hold,
+ * so when the length of the material is known the prompt states a minimum.
+ */
+function lengthTarget(sourceChars?: number) {
+  if (!sourceChars) return "";
+  const sourceWords = Math.round(sourceChars / 600) * 100;
+  const minimum = Math.min(Math.round((sourceWords * 0.35) / 100) * 100, 8000);
+  if (minimum < 300) return "";
+  return ` The material is about ${sourceWords.toLocaleString("en")} words long, so complete notes will need at least ${minimum.toLocaleString("en")} words.`;
+}
+
+/** `sourceChars` is the length of the material's text, when all of it is text the app can measure. */
+export function notesPrompt(kinds: SourceKind[], sourceChars?: number) {
+  if (kinds.length === 1) {
+    return `Create comprehensive study notes from this ${KIND_LABEL[kinds[0]]}.${lengthTarget(sourceChars)}`;
+  }
   return `Create one comprehensive, unified set of study notes from these ${kinds.length} sources (${kinds
     .map((k) => KIND_LABEL[k])
-    .join(", ")}). Merge overlapping content instead of repeating it, organize by topic rather than by source, and point out where the sources disagree.`;
+    .join(", ")}). Merge overlapping content instead of repeating it, organize by topic rather than by source, and point out where the sources disagree.${lengthTarget(sourceChars)}`;
 }
 
 export function transcriptPrompt(kind: SourceKind) {
@@ -203,7 +219,7 @@ export const LESSON_SCHEMA = {
         type: "object",
         properties: {
           heading: { type: "string" },
-          body: { type: "string", description: "2-4 short paragraphs of Markdown." },
+          body: { type: "string", description: "4-6 paragraphs of Markdown, about 250-350 words." },
           narration: {
             type: "string",
             description: "The body rewritten to be read aloud: plain sentences, no Markdown or symbols, math in words.",
@@ -243,8 +259,8 @@ const LEVEL_GUIDANCE: Record<LessonLevel, string> = {
 
 export function lessonPrompt(set: StudySet, level: LessonLevel, length: LessonLength, focus?: string) {
   return `Design an interactive, step-by-step lesson with exactly ${LESSON_SECTION_COUNT[length]} sections that teaches the study material below to a ${level} learner. The student reads one section at a time and continues when ready.
-- Sections build on each other: open with a hook that shows why the topic matters, teach the core ideas in a logical order, and end with a recap section.
-- heading: short and specific. body: 2-4 short, conversational paragraphs of Markdown with **bold** key terms, concrete examples or analogies, and LaTeX for math ($...$). No headings inside the body.
+- Sections build on each other: open with a hook that shows why the topic matters, teach the core ideas in a logical order, and end with a recap section. Between them, the sections teach every major topic of the material, not just an overview of it.
+- heading: short and specific. body: 4-6 conversational paragraphs of Markdown, about 250-350 words in all, that really teach the section's ideas: explain how and why things work, use the specific facts, terms, numbers and formulas from the material, and include a concrete example or analogy. Use **bold** for key terms and LaTeX for math ($...$). No headings inside the body. The opening hook and the recap can be shorter.
 - narration: the same content as the body, rewritten for a teacher to read aloud: plain sentences with no Markdown, symbols or emoji, and math said in words.
 - Give about half of the sections an illustration where a visual genuinely helps (a diagram, process, structure, scene or object). imagePrompt describes it concretely for an illustrator: the subject, the composition and a clean educational style. If labels help, list the exact short labels to draw, written in the lesson's language, with math as Unicode symbols (ℝ, ∈, ≤, ∪, ∞, x²) and never LaTeX. Leave imagePrompt and imageCaption empty for the other sections and for the recap.
 - Give every section except the first a check question with exactly 4 options, one correct answer and plausible distractors, testing understanding of that section. Keep the explanation to 1-2 sentences.

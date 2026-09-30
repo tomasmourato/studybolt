@@ -219,12 +219,13 @@ function markCooldown(model: string, ms: number) {
 
 const OVERLOAD_STATUSES = new Set([500, 502, 503, 504]);
 
-async function retrying<T>(run: () => Promise<T>, attempts = 2): Promise<T> {
+/** Repeats a Files API call after a server hiccup. Generation requests move to another model instead (see withModel). */
+async function retrying<T>(run: () => Promise<T>, attempts: number): Promise<T> {
   for (let attempt = 1; ; attempt++) {
     try {
       return await run();
     } catch (err) {
-      const overloaded = (err instanceof ApiError && OVERLOAD_STATUSES.has(err.status)) || err instanceof GeminiStreamError;
+      const overloaded = err instanceof ApiError && OVERLOAD_STATUSES.has(err.status);
       if (!overloaded || attempt >= attempts) throw err;
       await sleep(1500 * attempt);
     }
@@ -279,7 +280,9 @@ async function withModel<T>(kind: ModelKind, run: (model: string) => Promise<T>,
   let geminiError: unknown;
   for (const model of candidates) {
     try {
-      return await retrying(() => run(model));
+      // A model that fails isn't asked again straight away: an overloaded request can still count against
+      // its small daily quota, and the next model usually answers.
+      return await run(model);
     } catch (err) {
       const cooldown = cooldownFor(err);
       // Gemma is a last resort, so its failures never replace the reason the Gemini models gave.
@@ -455,7 +458,7 @@ export async function generateJson<T>(
 }
 
 /**
- * Streams text deltas. Errors before the first text are retried or fall back to another model;
+ * Streams text deltas. Errors before the first text fall back to another model;
  * errors after that are thrown to the caller, since part of the answer was already shown.
  */
 export async function* streamText(contents: ContentListUnion, options: GenerateOptions = {}): AsyncGenerator<string> {

@@ -194,8 +194,12 @@ async function processSet(id: string) {
           }),
     );
 
+    // The prompt asks for notes in proportion to the material, which only text sources let us measure up front.
+    const sourceChars = sources.every((s) => TEXT_KINDS.has(s.kind))
+      ? sources.reduce((sum, s) => sum + (s.text?.length ?? 0), 0)
+      : undefined;
     const notes = await patiently(
-      () => writeNotes(id, parts, notesPrompt(sources.map((s) => s.kind))),
+      () => writeNotes(id, parts, notesPrompt(sources.map((s) => s.kind), sourceChars)),
       (left) =>
         updateSet(id, (s) => {
           s.notes = "";
